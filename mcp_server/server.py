@@ -57,8 +57,8 @@ def extract_endpoints_with_types(file_path: str = None) -> Dict[str, Dict[str, t
     if file_path is None:
         # Get the directory where this script is located
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        # Go up one level to the project root, then into helixdb-cfg/queries.hx
-        file_path = os.path.join(script_dir, '..', 'helixdb-cfg', 'queries.hx')
+        # Go up one level to the project root, then into db/queries.hx
+        file_path = os.path.join(script_dir, '..', 'db', 'queries.hx')
     
     type_map = {
         'String': str,
