@@ -1,6 +1,7 @@
 use anyhow::Result;
 use ignore::WalkBuilder;
 use futures::future::join_all;
+use futures::StreamExt;
 use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
@@ -92,18 +93,26 @@ pub async fn populate(
         .filter(|entry| entry.path() != current_path)
         .collect();
 
-    // Process entries concurrently
-    let tasks: Vec<JoinHandle<Result<()>>> = entries.into_iter().map(|entry| {
+    // Limit ingestion-side parallelism to avoid request spikes against Helix.
+    let walk_concurrency: usize = std::env::var("INGEST_WALK_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1);  // Lowered from 2 to process files sequentially by default
+
+    let mut stream = futures::stream::iter(entries.into_iter().map(|entry| {
         let path_buf = entry.path().to_path_buf();
         let parent_id_clone = parent_id.clone();
         let index_types_clone = index_types.clone();
         let file_types_clone = file_types.clone();
         let tx_clone = tx.clone();
 
-        tokio::spawn(async move {
+        async move {
             if path_buf.is_dir() {
                 // Get folder information
-                let folder_name = path_buf.file_name().unwrap().to_str().unwrap();
+                let folder_name = path_buf
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "<unknown>".to_string());
                 let endpoint = if is_super {"createSuperFolder"} else {"createSubFolder"};
                 let url = format!("http://localhost:{}/{}", port, endpoint);
                 let payload = if is_super {
@@ -122,18 +131,16 @@ pub async fn populate(
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string())
                         {
-                            let path_buf_clone = path_buf.clone();
                             if let Err(e) = Box::pin(populate(
-                                path_buf_clone,folder_id,port,
-                                false,index_types_clone, file_types_clone, tx_clone
+                                path_buf, folder_id, port,
+                                false, index_types_clone, file_types_clone, tx_clone
                             )).await {
-                                eprintln!("Error populating folder {}: {}",folder_name, e);
+                                eprintln!("Error populating folder {}: {}", folder_name, e);
                             }
-                            Ok(())
                         } else {
                             eprintln!("Failed to extract folder ID from response for: {}", folder_name);
-                            Ok(())
                         }
+                        Ok(())
                     }
                     Err(e) => {
                         eprintln!("Failed to create folder {}: {}", folder_name, e);
@@ -142,17 +149,20 @@ pub async fn populate(
                 }
             } else if path_buf.is_file() {
                 process_file(
-                    path_buf,parent_id_clone,is_super,
-                    port, index_types_clone,file_types_clone,tx_clone
+                    path_buf, parent_id_clone, is_super,
+                    port, index_types_clone, file_types_clone, tx_clone
                 ).await
             } else {
                 Ok(())
             }
-        })
-    }).collect();
+        }
+    }))
+    .buffer_unordered(walk_concurrency);
 
-    for task in tasks {
-        task.await??;
+    while let Some(res) = stream.next().await {
+        // Individual item failures are already handled (logged + Ok(())) in most places,
+        // but preserve any remaining hard errors.
+        res?;
     }
 
     Ok(())
@@ -191,7 +201,13 @@ pub async fn process_file(
         // Parse file
         let mut parser = Parser::new();
         parser.set_language(&language)?;
-        let tree = parser.parse(&source_code, None).unwrap();
+        let tree = match parser.parse(&source_code, None) {
+            Some(t) => t,
+            None => {
+                eprintln!("Failed to parse file {} with tree-sitter; skipping", file_name);
+                return Ok(());
+            }
+        };
 
         // Create file
         let file_type = if is_super { "super" } else { "sub" };
@@ -209,7 +225,8 @@ pub async fn process_file(
             Ok(response) => response,
             Err(e) => {
                 eprintln!("Failed to create file {}: {}", file_name, e);
-                return Err(anyhow::anyhow!("Failed to create file: {}", e));
+                // Don't abort ingestion; just skip this file.
+                return Ok(());
             }
         };
 
@@ -218,14 +235,17 @@ pub async fn process_file(
             return Ok(());
         }
 
-        let file_id = file_response
+        let file_id = match file_response
             .get("file")
             .and_then(|v| v.get("id"))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
+        {
+            Some(id) => id,
+            None => {
                 eprintln!("Failed to extract file ID from response for: {}", file_name);
-                anyhow::anyhow!("File ID not found in response")
-            })?;
+                return Ok(());
+            }
+        };
 
         // Process entities
         let root_node = tree.root_node();
@@ -243,16 +263,38 @@ pub async fn process_file(
 
         // Send request to create file
         println!("\nProcessing unsupported file: {}", file_name);
-        let response = post_request_async(&url, payload).await?;
+        let response = match post_request_async(&url, payload).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Failed to create unsupported file {}: {}", file_name, e);
+                return Ok(());
+            }
+        };
 
         if !unsupported.iter().any(|v| v.as_str().map_or(false, |s| s == extension || s == "ALL")){
             println!("File {} is skipped", file_name);
             return Ok(());
         }
 
-        let file_id = response.get("file").and_then(|v| v.get("id")).and_then(|v| v.as_str()).ok_or_else(|| anyhow::anyhow!("File ID not found"))?;
+        let file_id = match response
+            .get("file")
+            .and_then(|v| v.get("id"))
+            .and_then(|v| v.as_str())
+        {
+            Some(id) => id,
+            None => {
+                eprintln!("File ID not found in response for unsupported file: {}", file_name);
+                return Ok(());
+            }
+        };
 
-        let chunks = chunk_entity(&source_code).unwrap();
+        let chunks = match chunk_entity(&source_code) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Failed to chunk unsupported file {}: {}", file_name, e);
+                return Ok(());
+            }
+        };
         let order_counter = Arc::new(AtomicUsize::new(1));
         TOTAL_CHUNKS.fetch_add(chunks.len(), Ordering::SeqCst);
 
@@ -443,24 +485,57 @@ async fn process_entity(
                 types_array.iter().any(|v| v.as_str().map_or(false, |s| s == "ALL")) {
                     let endpoint = if is_super {"createSuperEntity"} else {"createSubEntity"};
                     let url = format!("http://localhost:{}/{}", port, endpoint);
-                    let id_name = if is_super {"file_id"} else {"entity_id"};
-                    let payload = json!({
-                        id_name: parent_id.clone(),
-                        "entity_type": code_entity.entity_type,
-                        "text": code_entity.text,
-                        "start_byte": code_entity.start_byte,
-                        "end_byte": code_entity.end_byte,
-                        "order": code_entity.order,
-                    });
-                    let entity_response = post_request_async(&url, payload).await?;
-                    let entity_id = entity_response
+                    let payload = if is_super {
+                        json!({
+                            "file_id": parent_id.clone(),
+                            "entity_type": code_entity.entity_type,
+                            "text": code_entity.text,
+                            "start_byte": code_entity.start_byte,
+                            "end_byte": code_entity.end_byte,
+                            "order": code_entity.order,
+                        })
+                    } else {
+                        json!({
+                            "entity_id": parent_id.clone(),
+                            "entity_type": code_entity.entity_type,
+                            "text": code_entity.text,
+                            "start_byte": code_entity.start_byte,
+                            "end_byte": code_entity.end_byte,
+                            "order": code_entity.order,
+                        })
+                    };
+                    let entity_response = match post_request_async(&url, payload).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            // Transient Helix errors shouldn't kill ingestion; skip this entity.
+                            eprintln!(
+                                "Failed to create {} entity ({}); skipping: {}",
+                                if is_super { "super" } else { "sub" },
+                                entity_type,
+                                e
+                            );
+                            return Ok(());
+                        }
+                    };
+                    let entity_id = match entity_response
                         .get("entity")
                         .and_then(|v| v.get("id"))
                         .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                        .ok_or_else(|| anyhow::anyhow!("Entity ID not found"))?;
+                    {
+                        Some(id) => id.to_string(),
+                        None => {
+                            eprintln!("Entity ID not found in response ({}); skipping", entity_type);
+                            return Ok(());
+                        }
+                    };
                     if is_super {
-                        let chunks = chunk_entity(&code_entity.text).unwrap();
+                        let chunks = match chunk_entity(&code_entity.text) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                eprintln!("Failed to chunk entity {}: {}", entity_id, e);
+                                Vec::new()
+                            }
+                        };
                         TOTAL_CHUNKS.fetch_add(chunks.len(), Ordering::SeqCst);
                         let chunk_tasks: Vec<JoinHandle<()>> = chunks.into_iter().map(|chunk| {
                             let chunk_clone = chunk.clone();

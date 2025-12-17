@@ -17,6 +17,9 @@ use std::sync::{
 };
 use std::collections::HashMap;
 use tokio::task::JoinHandle;
+use tokio::sync::Semaphore;
+use tokio::time::sleep;
+use rand::Rng;
 use crate::queries::{get_sub_folders, get_folder_files};
 use async_recursion::async_recursion;
 
@@ -52,8 +55,23 @@ lazy_static! {
     static ref EMBEDDING_LIMITER: RateLimiter<NotKeyed, InMemoryState, DefaultClock> =
         RateLimiter::direct(Quota::per_minute(NonZeroU32::new(4000).unwrap()));
 
-    static ref HELIX_LIMITER: RateLimiter<NotKeyed, InMemoryState, DefaultClock> =
-        RateLimiter::direct(Quota::per_second(NonZeroU32::new(100).unwrap()));
+    static ref HELIX_LIMITER: RateLimiter<NotKeyed, InMemoryState, DefaultClock> = {
+        let rps = env::var("HELIX_RPS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(8);  // Lowered from 20 to avoid overwhelming Helix
+        RateLimiter::direct(Quota::per_second(NonZeroU32::new(rps.max(1)).unwrap()))
+    };
+
+    // Cap in-flight Helix requests. This avoids overwhelming the Helix HTTP server with large
+    // bursts of concurrent POSTs (which often manifests as "connection reset by peer").
+    static ref HELIX_IN_FLIGHT: Semaphore = {
+        let max_in_flight = env::var("HELIX_MAX_IN_FLIGHT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2);  // Lowered from 5 to avoid connection resets
+        Semaphore::new(max_in_flight)
+    };
 }
 
 // Chunk entity text
@@ -130,22 +148,79 @@ pub async fn embed_entity_async(text: String) -> Result<Vec<f64>> {
 
 // Async version of post_request
 pub async fn post_request_async(url: &str, body: Value) -> Result<Value> {
-    HELIX_LIMITER.until_ready().await;
+    let _permit = HELIX_IN_FLIGHT
+        .acquire()
+        .await
+        .map_err(|_| anyhow::anyhow!("Helix request semaphore closed"))?;
 
-    // Use the global HTTP client with connection pooling
-    let res = match helix_client.post(url).json(&body).send().await {
-        Ok(response) => response,
-        Err(e) => {
-            if e.is_timeout() {
-                println!("Request timed out. Check if the server is running and responding.");
-            } else if e.is_connect() {
-                println!("Connection failed. Make sure the server is running at {}",url);
+    let max_retries = env::var("HELIX_HTTP_RETRIES")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(5);
+
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        HELIX_LIMITER.until_ready().await;
+
+        // Use the global HTTP client with connection pooling
+        let send_res = helix_client.post(url).json(&body).send().await;
+        match send_res {
+            Ok(res) => {
+                let status = res.status();
+                if !status.is_success() {
+                    // Try to include body text for debugging, but treat as retryable for common transient codes.
+                    let body_text = res
+                        .text()
+                        .await
+                        .unwrap_or_else(|_| "<could not read response body>".to_string());
+
+                    let retryable = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504);
+                    if retryable && attempt <= max_retries {
+                        let base_ms = (500u64).saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1)));
+                        let jitter = rand::rng().random_range(0..200);
+                        let backoff_ms = base_ms.saturating_add(jitter).min(5000);
+                        sleep(Duration::from_millis(backoff_ms)).await;
+                        continue;
+                    }
+
+                    return Err(anyhow::anyhow!(
+                        "Helix returned HTTP {} for {}: {}",
+                        status,
+                        url,
+                        body_text
+                    ));
+                }
+
+                // Parse JSON response
+                return Ok(res.json::<Value>().await?);
             }
-            return Err(anyhow::anyhow!("HTTP request failed: {}", e));
-        }
-    };
+            Err(e) => {
+                let msg = e.to_string();
+                let retryable = e.is_timeout()
+                    || e.is_connect()
+                    || msg.contains("connection reset by peer")
+                    || msg.contains("connection closed before message completed")
+                    || msg.contains("channel closed");
 
-    Ok(res.json::<Value>().await?)
+                if e.is_timeout() {
+                    eprintln!("Request timed out. Check if the server is running and responding.");
+                } else if e.is_connect() {
+                    eprintln!("Connection failed. Make sure the server is running at {}", url);
+                }
+
+                if retryable && attempt <= max_retries {
+                    let base_ms = (500u64).saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1)));
+                    let jitter = rand::rng().random_range(0..200);
+                    let backoff_ms = base_ms.saturating_add(jitter).min(5000);
+                    sleep(Duration::from_millis(backoff_ms)).await;
+                    continue;
+                }
+
+                return Err(anyhow::anyhow!("HTTP request failed: {}", e));
+            }
+        }
+    }
 }
 
 // Get language from file extension

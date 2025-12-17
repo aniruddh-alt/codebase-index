@@ -1,32 +1,31 @@
-mod utils;
+mod ingestion;
 mod queries;
 mod updater;
-mod ingestion;
+mod utils;
 
 // External crates
 use anyhow::Result;
+use clearscreen;
+use dotenv;
+use futures::StreamExt;
+use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::json;
 use std::env;
-use std::path::PathBuf;
-use std::time::Instant;
 use std::io;
 use std::io::Write;
-use dotenv;
-use tokio_stream;
-use futures::StreamExt;
-use clearscreen;
+use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use indicatif::{ProgressBar, ProgressStyle};
+use std::time::Instant;
+use tokio_stream;
 
 // Internal utility functions
 use utils::{
-    embed_entity_async, post_request_async, EmbeddingJob,
+    embed_entity_async, post_request_async, EmbeddingJob, COMPLETED_EMBEDDINGS, PENDING_EMBEDDINGS,
     TOTAL_CHUNKS,
-    PENDING_EMBEDDINGS, COMPLETED_EMBEDDINGS,
 };
 
-use updater::update;
 use ingestion::ingestion;
+use updater::update;
 
 // Remove embedding_wait_thread function entirely
 
@@ -35,48 +34,62 @@ async fn async_main() {
     let args: Vec<String> = env::args().collect();
 
     let default_port = 6969;
-    
+
     // Get arguments
-    let path: String = if args.len() > 1 { args[1].clone() } else { "sample".to_string() };
-    let port: u16 = if args.len() > 2 { args[2].parse::<u16>().unwrap() } else { default_port };
-    let channel_buffer_size = 1000;
+    let path: String = if args.len() > 1 {
+        args[1].clone()
+    } else {
+        "sample".to_string()
+    };
+    let port: u16 = if args.len() > 2 {
+        args[2].parse::<u16>().unwrap()
+    } else {
+        default_port
+    };
+    let channel_buffer_size = 10; // Reduced from 1000 to prevent API rate limiting
 
     println!("\nConnecting to Helix instance at port {}", port);
 
     dotenv::dotenv().ok();
-    
+
     let (tx, rx) = tokio::sync::mpsc::channel::<EmbeddingJob>(channel_buffer_size);
 
     // Spawn the async background task for embedding jobs
     tokio::spawn(async move {
-        // Set concurrent embeddings to better utilize our rate limit
-        let max_concurrent_embeddings = 100;
-        
+        // Posting embeddings back into Helix can overwhelm the Helix HTTP server if too concurrent.
+        // Keep this conservative by default; override via HELIX_EMBED_POST_CONCURRENCY if needed.
+        let max_concurrent_embeddings: usize = env::var("HELIX_EMBED_POST_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2);  // Lowered from 5 to avoid overwhelming Helix
+
         // Create a stream from the channel
         let mut job_stream = tokio_stream::wrappers::ReceiverStream::new(rx)
-            .map(|job| {
-                async move {
-                    let EmbeddingJob { chunk, entity_id, port } = job;
-                    if !chunk.is_empty() {
-                        PENDING_EMBEDDINGS.fetch_add(1, Ordering::SeqCst);
-                        match embed_entity_async(chunk).await {
-                            Ok(embedding) => {
-                                let url = format!("http://localhost:{}/{}", port, "embedSuperEntity");
-                                let payload = json!({"entity_id": entity_id,"vector": embedding,});
-                                if let Err(e) = post_request_async(&url, payload).await {
-                                    eprintln!("Failed to post embedding: {}", e);
-                                }
-                                COMPLETED_EMBEDDINGS.fetch_add(1, Ordering::SeqCst);
+            .map(|job| async move {
+                let EmbeddingJob {
+                    chunk,
+                    entity_id,
+                    port,
+                } = job;
+                if !chunk.is_empty() {
+                    PENDING_EMBEDDINGS.fetch_add(1, Ordering::SeqCst);
+                    match embed_entity_async(chunk).await {
+                        Ok(embedding) => {
+                            let url = format!("http://localhost:{}/{}", port, "embedSuperEntity");
+                            let payload = json!({"entity_id": entity_id,"vector": embedding,});
+                            if let Err(e) = post_request_async(&url, payload).await {
+                                eprintln!("Failed to post embedding: {}", e);
                             }
-                            Err(e) => {
-                                eprintln!("Failed to embed chunk: {}", e);
-                            }
+                            COMPLETED_EMBEDDINGS.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to embed chunk: {}", e);
                         }
                     }
                 }
             })
             .buffer_unordered(max_concurrent_embeddings);
-        
+
         // Process the stream
         while let Some(_) = job_stream.next().await {}
     });
@@ -84,51 +97,82 @@ async fn async_main() {
     let mut root_id = String::new();
 
     loop {
-        root_id = parse_user_input(root_id.clone(), path.clone(), port, tx.clone()).await.unwrap();
+        match parse_user_input(root_id.clone(), path.clone(), port, tx.clone()).await {
+            Ok(next_root_id) => root_id = next_root_id,
+            Err(e) => {
+                eprintln!("\nOperation failed: {e}");
+                eprintln!("Tip: confirm your Helix instance is healthy on port {port}, then retry.");
+                // Keep the UI loop alive so the user can retry without restarting the binary.
+                continue;
+            }
+        }
         if root_id == "EXIT" {
             break;
         }
     }
 }
 
-async fn parse_user_input(root_id: String, path: String, port: u16, tx: tokio::sync::mpsc::Sender<EmbeddingJob>) -> Result<String> {
+async fn parse_user_input(
+    root_id: String,
+    path: String,
+    port: u16,
+    tx: tokio::sync::mpsc::Sender<EmbeddingJob>,
+) -> Result<String> {
     let path_buf = PathBuf::from(path.clone());
     let root_name = path_buf.file_name().unwrap().to_str().unwrap();
     println!("\nWhat would you like to do?\n");
     println!("1 : Ingest {}", &root_name);
     println!("2 : Update {}", &root_name);
     println!("3 : Exit");
-    
+
     io::stdout().flush().unwrap();
     let mut input = String::new();
     io::stdin().read_line(&mut input).unwrap();
     let input = input.trim().to_string();
     let start_time = Instant::now();
     if input == "1" {
-        let root_id = ingestion(
-            path_buf.canonicalize().expect("Failed to canonicalize path"),
+        let root_id_res = ingestion(
+            path_buf
+                .canonicalize()
+                .expect("Failed to canonicalize path"),
             port,
             tx.clone(),
-        ).await;
+        )
+        .await;
 
-        clear_screen();
+        // clear_screen();
 
-        println!("\nTotal chunks processed: {}", TOTAL_CHUNKS.load(Ordering::SeqCst));
-        println!("\nIngestion finished in {} seconds", start_time.elapsed().as_secs());
+        println!(
+            "\nTotal chunks processed: {}",
+            TOTAL_CHUNKS.load(Ordering::SeqCst)
+        );
+        println!(
+            "\nIngestion finished in {} seconds",
+            start_time.elapsed().as_secs()
+        );
         wait_for_embeddings(start_time).await;
         TOTAL_CHUNKS.store(0, Ordering::SeqCst);
 
-        return Ok(root_id.unwrap().to_string());
+        // Do not panic on transient Helix connection failures.
+        // Bubble the error up so async_main can render a friendly message.
+        return root_id_res;
     } else if input == "2" {
         clear_screen();
         let root_ids = get_root_ids(port).await?;
         if root_ids.contains(&root_id) {
             println!("\nUpdating index...");
             let _ = update(
-                path_buf.canonicalize().unwrap(), root_id.clone(), 
-                port, tx.clone(), 5
-            ).await;
-            println!("\nUpdate finished in {} seconds", start_time.elapsed().as_secs());
+                path_buf.canonicalize().unwrap(),
+                root_id.clone(),
+                port,
+                tx.clone(),
+                5,
+            )
+            .await;
+            println!(
+                "\nUpdate finished in {} seconds",
+                start_time.elapsed().as_secs()
+            );
             wait_for_embeddings(start_time).await;
             TOTAL_CHUNKS.store(0, Ordering::SeqCst);
             return Ok(root_id);
@@ -152,9 +196,16 @@ async fn wait_for_embeddings(start_time: Instant) {
     if PENDING_EMBEDDINGS.load(Ordering::SeqCst) > 0 {
         let start_amount = PENDING_EMBEDDINGS.load(Ordering::SeqCst);
         let bar = ProgressBar::new(start_amount as u64);
-        bar.set_style(ProgressStyle::with_template("[{elapsed_precise}] {wide_bar} {pos}/{len} ({per_sec}, ETA: {eta})").unwrap());
+        bar.set_style(
+            ProgressStyle::with_template(
+                "[{elapsed_precise}] {wide_bar} {pos}/{len} ({per_sec}, ETA: {eta})",
+            )
+            .unwrap(),
+        );
         let mut last_completed = 0;
-        while COMPLETED_EMBEDDINGS.load(Ordering::SeqCst) < PENDING_EMBEDDINGS.load(Ordering::SeqCst) {
+        while COMPLETED_EMBEDDINGS.load(Ordering::SeqCst)
+            < PENDING_EMBEDDINGS.load(Ordering::SeqCst)
+        {
             sleep(Duration::from_millis(100)).await;
             let completed = COMPLETED_EMBEDDINGS.load(Ordering::SeqCst);
             let pending = PENDING_EMBEDDINGS.load(Ordering::SeqCst);
@@ -169,8 +220,14 @@ async fn wait_for_embeddings(start_time: Instant) {
         }
         bar.finish();
     }
-    println!("\nTotal embeddings completed: {}", COMPLETED_EMBEDDINGS.load(Ordering::SeqCst));
-    println!("\nTotal time taken: {} seconds", start_time.elapsed().as_secs_f64());
+    println!(
+        "\nTotal embeddings completed: {}",
+        COMPLETED_EMBEDDINGS.load(Ordering::SeqCst)
+    );
+    println!(
+        "\nTotal time taken: {} seconds",
+        start_time.elapsed().as_secs_f64()
+    );
     PENDING_EMBEDDINGS.store(0, Ordering::SeqCst);
     COMPLETED_EMBEDDINGS.store(0, Ordering::SeqCst);
 }
@@ -185,7 +242,11 @@ async fn get_root_ids(port: u16) -> Result<Vec<String>> {
     let root_ids = response
         .get("root")
         .and_then(|v| v.as_array())
-        .map(|v| v.iter().map(|v| v.get("id").and_then(|v| v.as_str()).unwrap().to_string()).collect())
+        .map(|v| {
+            v.iter()
+                .map(|v| v.get("id").and_then(|v| v.as_str()).unwrap().to_string())
+                .collect()
+        })
         .ok_or_else(|| anyhow::anyhow!("Root ID not found"))?;
     Ok(root_ids)
 }
@@ -195,6 +256,6 @@ fn main() {
         .enable_all()
         .build()
         .unwrap();
-    
+
     rt.block_on(async_main());
 }
